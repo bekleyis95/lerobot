@@ -43,7 +43,9 @@ Key mapping (see `KeyboardEndEffectorTeleop`):
     left ctrl    -> close gripper   right ctrl  -> open gripper
 """
 
+import argparse
 import logging
+import math
 import time
 
 from lerobot.model.kinematics import RobotKinematics
@@ -82,8 +84,25 @@ GRIPPER_SPEED_FACTOR = 0.05
 # Radians rotated per control tick per unit keyboard delta (~15 deg/s at 30 FPS).
 EE_ROT_STEP_RAD = 0.0087
 
+# The keyboard's delta_x/delta_y come from a fixed key layout that has no idea where you're
+# actually standing relative to the robot's base frame. If pushing "forward" doesn't move
+# the arm away from you, or left/right feels swapped, rotate here - try 90, 180, or 270.
+OPERATOR_VIEW_ROTATION_DEG = 0.0
 
-def main():
+
+def _apply_operator_view_rotation(action: RobotAction, degrees: float) -> RobotAction:
+    """Rotate delta_x/delta_y in the ground plane so they match the operator's viewpoint."""
+    if not degrees:
+        return action
+    theta = math.radians(degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    dx, dy = action["delta_x"], action["delta_y"]
+    action["delta_x"] = dx * cos_t - dy * sin_t
+    action["delta_y"] = dx * sin_t + dy * cos_t
+    return action
+
+
+def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
     # Initialize the robot and teleoperator
     robot_config = SO100FollowerConfig(
         port="/dev/tty.usbmodem5A460814411", id="my_awesome_follower_arm", use_degrees=True
@@ -172,7 +191,9 @@ def main():
             robot_obs = robot.get_observation()
 
             # Get teleop action
-            keyboard_action = teleop_device.get_action()
+            keyboard_action = _apply_operator_view_rotation(
+                teleop_device.get_action(), operator_view_rotation_deg
+            )
 
             # Keyboard deltas -> EE pose -> Joints transition
             joint_action = keyboard_to_robot_joints_processor((keyboard_action, robot_obs))
@@ -193,4 +214,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--operator-view-rotation-deg",
+        type=float,
+        default=OPERATOR_VIEW_ROTATION_DEG,
+        help=(
+            "Degrees to rotate delta_x/delta_y so they match where you're standing "
+            "relative to the robot. If pushing 'forward' doesn't move the arm away from "
+            "you, or left/right feels swapped, try 90, 180, or 270."
+        ),
+    )
+    args = parser.parse_args()
+    main(operator_view_rotation_deg=args.operator_view_rotation_deg)
