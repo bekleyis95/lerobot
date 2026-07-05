@@ -32,6 +32,10 @@ if TYPE_CHECKING or _hidapi_available:
 else:
     hid = None  # type: ignore[assignment]
 
+# USB product ID for the Logitech Dual Action, which reports a different HID layout than
+# the Logitech RumblePad 2 the rest of GamepadControllerHID's parsing assumes.
+LOGITECH_DUAL_ACTION_PRODUCT_ID = 0xC216
+
 
 class InputController:
     """Base class for input controllers that generate motion deltas."""
@@ -65,6 +69,13 @@ class InputController:
     def get_deltas(self):
         """Get the current movement deltas (dx, dy, dz) in meters."""
         return 0.0, 0.0, 0.0
+
+    def get_rotation_deltas(self):
+        """Get the current orientation deltas (droll, dpitch), normalized to [-1, 1].
+
+        Not every controller/mode supports orientation; defaults to no rotation.
+        """
+        return 0.0, 0.0
 
     def update(self):
         """Update controller state - call this once per frame."""
@@ -354,6 +365,9 @@ class GamepadControllerHID(InputController):
         self.right_x = 0.0
         self.right_y = 0.0
 
+        # D-pad hat state (Dual Action only); 8 = neutral, see _parse_dual_action_report.
+        self.dpad_hat = 8
+
         # Button states
         self.buttons = {}
 
@@ -421,47 +435,100 @@ class GamepadControllerHID(InputController):
         try:
             # Read data from the gamepad
             data = self.device.read(64)
-            # Interpret gamepad data - this will vary by controller model
-            # These offsets are for the Logitech RumblePad 2
-            if data and len(data) >= 8:
-                # Normalize joystick values from 0-255 to -1.0-1.0
-                self.left_y = (data[1] - 128) / 128.0
-                self.left_x = (data[2] - 128) / 128.0
-                self.right_x = (data[3] - 128) / 128.0
-                self.right_y = (data[4] - 128) / 128.0
+            if not data or len(data) < 8:
+                return
 
-                # Apply deadzone
-                self.left_y = 0 if abs(self.left_y) < self.deadzone else self.left_y
-                self.left_x = 0 if abs(self.left_x) < self.deadzone else self.left_x
-                self.right_x = 0 if abs(self.right_x) < self.deadzone else self.right_x
-                self.right_y = 0 if abs(self.right_y) < self.deadzone else self.right_y
-
-                # Parse button states (byte 5 in the Logitech RumblePad 2)
-                buttons = data[5]
-
-                # Check if RB is pressed then the intervention flag should be set
-                self.intervention_flag = data[6] in [2, 6, 10, 14]
-
-                # Check if RT is pressed
-                self.open_gripper_command = data[6] in [8, 10, 12]
-
-                # Check if LT is pressed
-                self.close_gripper_command = data[6] in [4, 6, 12]
-
-                # Check if Y/Triangle button (bit 7) is pressed for saving
-                # Check if X/Square button (bit 5) is pressed for failure
-                # Check if A/Cross button (bit 4) is pressed for rerecording
-                if buttons & 1 << 7:
-                    self.episode_end_status = TeleopEvents.SUCCESS
-                elif buttons & 1 << 5:
-                    self.episode_end_status = TeleopEvents.FAILURE
-                elif buttons & 1 << 4:
-                    self.episode_end_status = TeleopEvents.RERECORD_EPISODE
-                else:
-                    self.episode_end_status = None
+            # Report layout varies by controller model/mode; dispatch on product ID.
+            product_id = (self.device_info or {}).get("product_id")
+            if product_id == LOGITECH_DUAL_ACTION_PRODUCT_ID:
+                self._parse_dual_action_report(data)
+            else:
+                self._parse_rumblepad2_report(data)
 
         except OSError as e:
             logging.error(f"Error reading from gamepad: {e}")
+
+    def _parse_rumblepad2_report(self, data):
+        """Byte offsets for the Logitech RumblePad 2."""
+        # Normalize joystick values from 0-255 to -1.0-1.0
+        self.left_y = (data[1] - 128) / 128.0
+        self.left_x = (data[2] - 128) / 128.0
+        self.right_x = (data[3] - 128) / 128.0
+        self.right_y = (data[4] - 128) / 128.0
+        self._apply_deadzone()
+
+        # Parse button states (byte 5 in the Logitech RumblePad 2)
+        buttons = data[5]
+
+        # Check if RB is pressed then the intervention flag should be set
+        self.intervention_flag = data[6] in [2, 6, 10, 14]
+
+        # Check if RT is pressed
+        self.open_gripper_command = data[6] in [8, 10, 12]
+
+        # Check if LT is pressed
+        self.close_gripper_command = data[6] in [4, 6, 12]
+
+        # Check if Y/Triangle button (bit 7) is pressed for saving
+        # Check if X/Square button (bit 5) is pressed for failure
+        # Check if A/Cross button (bit 4) is pressed for rerecording
+        if buttons & 1 << 7:
+            self.episode_end_status = TeleopEvents.SUCCESS
+        elif buttons & 1 << 5:
+            self.episode_end_status = TeleopEvents.FAILURE
+        elif buttons & 1 << 4:
+            self.episode_end_status = TeleopEvents.RERECORD_EPISODE
+        else:
+            self.episode_end_status = None
+
+    def _parse_dual_action_report(self, data):
+        """Byte offsets for the Logitech Dual Action (vendor 0x046d, product 0xc216).
+
+        Reverse-engineered from raw report dumps (a different, simpler layout than the
+        RumblePad 2's): sticks are data[0:4] in natural order, and buttons are bit-packed
+        into data[4] (D-pad hat in the low nibble, face buttons in the high nibble) and
+        data[5] (stick-clicks and triggers) - unlike the RumblePad 2, data[6]/data[7] are
+        unused by this controller.
+
+        Right stick X and the D-pad up/down are otherwise-unused inputs on this layout, so
+        they double as end-effector roll/pitch for orientation control (see
+        `get_rotation_deltas`).
+        """
+        self.left_x = (data[0] - 128) / 128.0
+        self.left_y = (data[1] - 128) / 128.0
+        self.right_x = (data[2] - 128) / 128.0
+        self.right_y = (data[3] - 128) / 128.0
+        self._apply_deadzone()
+
+        face_buttons = data[4]
+        other_buttons = data[5]
+
+        # Standard HID hat switch in the low nibble: 0=up, 2=right, 4=down, 6=left, 8=neutral.
+        self.dpad_hat = face_buttons & 0x0F
+
+        # LT = bit 2 (close), RT = bit 3 (open); flip if your controller's grip feels backwards.
+        self.close_gripper_command = bool(other_buttons & (1 << 2))
+        self.open_gripper_command = bool(other_buttons & (1 << 3))
+
+        # No dedicated intervention button identified for this controller; R3 (bit 1) is
+        # the closest spare, mirroring the RumblePad 2's use of a shoulder button.
+        self.intervention_flag = bool(other_buttons & (1 << 1))
+
+        # Y (bit 7) for saving, X (bit 4) for failure, A (bit 5) for rerecording.
+        if face_buttons & (1 << 7):
+            self.episode_end_status = TeleopEvents.SUCCESS
+        elif face_buttons & (1 << 4):
+            self.episode_end_status = TeleopEvents.FAILURE
+        elif face_buttons & (1 << 5):
+            self.episode_end_status = TeleopEvents.RERECORD_EPISODE
+        else:
+            self.episode_end_status = None
+
+    def _apply_deadzone(self):
+        self.left_x = 0 if abs(self.left_x) < self.deadzone else self.left_x
+        self.left_y = 0 if abs(self.left_y) < self.deadzone else self.left_y
+        self.right_x = 0 if abs(self.right_x) < self.deadzone else self.right_x
+        self.right_y = 0 if abs(self.right_y) < self.deadzone else self.right_y
 
     def get_deltas(self):
         """Get the current movement deltas from gamepad state."""
@@ -471,3 +538,18 @@ class GamepadControllerHID(InputController):
         delta_z = -self.right_y * self.z_step_size  # Up/down
 
         return delta_x, delta_y, delta_z
+
+    def get_rotation_deltas(self):
+        """Get the current orientation deltas: roll from the right stick X, pitch from
+        the D-pad up/down (bit-packed hat: 0=up, 4=down, 8=neutral - see
+        `_parse_dual_action_report`). Pitch only works on the Dual Action layout; the
+        RumblePad 2 path never updates `dpad_hat`, so pitch reads as 0 there.
+        """
+        droll = self.right_x
+        if self.dpad_hat == 0:
+            dpitch = 1.0
+        elif self.dpad_hat == 4:
+            dpitch = -1.0
+        else:
+            dpitch = 0.0
+        return droll, dpitch
