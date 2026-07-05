@@ -14,33 +14,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Teleoperate an SO100 follower arm in end-effector space with only a keyboard.
+"""Teleoperate an SO100 follower arm in end-effector space with only a gamepad.
 
-No leader arm is needed: keyboard key presses are mapped to end-effector deltas,
-converted to joint commands through the same kinematics processor steps used by
-the HIL-SERL gym environment.
+No leader arm is needed: gamepad stick/button input is mapped to end-effector deltas,
+converted to joint commands through the same kinematics processor steps used by the
+keyboard example (``examples/keyboard_to_so100/teleoperate.py``) and the HIL-SERL gym
+environment.
 
-The end-effector reference pose is computed from the previously *commanded* joints
-(via the IK solution carried across ticks), not the measured ones. Measured joints
-sag under gravity and jitter around the command, so feeding them back into the
-target makes the end-effector drift and oscillate. Commanding relative to the last
-commanded pose also bounds how far the target can lead the robot, so motion
-reverses instantly at workspace limits instead of having to unwind an accumulated
-overshoot.
+The end-effector reference pose is computed from the previously *commanded* joints (via
+the IK solution carried across ticks), not the measured ones - see the keyboard example's
+docstring for why.
 
-The SO100 has 5 joints, so on top of x/y/z the end-effector has exactly two
-controllable orientation degrees of freedom: pitch (where the nose points, e.g.
-pointing down at a piece on the table) and roll about the gripper axis (which acts
-as yaw of the jaws when the nose points down). Both are enabled here via
-``use_orientation=True``. True world-yaw is coupled to the base pan and follows
-from the commanded x/y position.
+The SO100 has 5 joints, so on top of x/y/z the end-effector has exactly two controllable
+orientation degrees of freedom: pitch and roll about the gripper axis. Both are enabled
+here via ``use_orientation=True``.
 
-Key mapping (see `KeyboardEndEffectorTeleop`):
-    arrow keys   -> x / y translation
-    shift        -> z down          right shift -> z up
-    i / k        -> pitch nose up / down
-    j / l        -> roll about the gripper axis
-    left ctrl    -> close gripper   right ctrl  -> open gripper
+Gamepad mapping (see `GamepadTeleop` / `GamepadControllerHID`):
+    left stick          -> x / y translation
+    right stick (up/down)   -> z
+    right stick (left/right) -> roll about the gripper axis
+    D-pad up / down     -> pitch nose up / down
+    LT / RT             -> close / open gripper
+
+Orientation and D-pad support are currently only implemented for the Logitech Dual Action
+controller's HID report layout on macOS (vendor 0x046d, product 0xc216); other
+controllers/platforms fall back to x/y/z + gripper only (see `gamepad_utils.py`).
+
+For recording datasets, replaying episodes, and evaluating policies, see
+``examples/keyboard_to_so100/`` - actions are recorded in end-effector space, so those
+scripts work identically regardless of which teleop device produced the data (only
+``record.py``'s teleop construction would need the swap shown here).
 """
 
 import argparse
@@ -63,30 +66,32 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
     GripperVelocityToJoint,
     InverseKinematicsRLStep,
 )
-from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
+from lerobot.teleoperators.gamepad import GamepadTeleop, GamepadTeleopConfig
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 FPS = 30
 
-# Meters moved per control tick per unit keyboard delta (~0.12 m/s at 30 FPS).
+# Meters moved per control tick at full stick deflection (~0.12 m/s at 30 FPS).
 EE_STEP_SIZE_M = 0.004
 
 # Workspace box (meters, in the robot base frame) the end-effector target is clipped to.
 # Adjust to your mounting: the SO100 reaches roughly 0.45 m.
 EE_BOUNDS = {"min": [-0.45, -0.45, 0.02], "max": [0.45, 0.45, 0.45]}
 
-# Gripper position change per tick for the discrete open/close keys. Depending on how
+# Gripper position change per tick for the discrete open/close commands. Depending on how
 # your gripper was assembled and calibrated, open/close may be swapped: flip the sign.
 GRIPPER_SPEED_FACTOR = 0.05
 
-# Radians rotated per control tick per unit keyboard delta (~15 deg/s at 30 FPS).
+# Radians rotated per control tick for the D-pad's discrete pitch (~15 deg/s at 30 FPS).
+# Roll is continuous (from the right stick), scaled by the same constant at full deflection.
 EE_ROT_STEP_RAD = 0.0087
 
-# The keyboard's delta_x/delta_y come from a fixed key layout that has no idea where you're
+# The gamepad's delta_x/delta_y come from a fixed stick layout that has no idea where you're
 # actually standing relative to the robot's base frame. If pushing "forward" doesn't move
 # the arm away from you, or left/right feels swapped, rotate here - try 90, 180, or 270.
+# (Same convention and same fix as examples/keyboard_to_so100/teleoperate.py.)
 OPERATOR_VIEW_ROTATION_DEG = 0.0
 
 
@@ -107,11 +112,11 @@ def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
     robot_config = SO100FollowerConfig(
         port="/dev/tty.usbmodem5A460814411", id="my_awesome_follower_arm", use_degrees=True
     )
-    teleop_config = KeyboardEndEffectorTeleopConfig(use_gripper=True, use_orientation=True)
+    teleop_config = GamepadTeleopConfig(use_gripper=True, use_orientation=True)
 
     # Initialize the robot and teleoperator
     robot = SO100Follower(robot_config)
-    teleop_device = KeyboardEndEffectorTeleop(teleop_config)
+    teleop_device = GamepadTeleop(teleop_config)
 
     # NOTE: It is highly recommended to use the urdf in the SO-ARM100 repo: https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf
     kinematics_solver = RobotKinematics(
@@ -129,8 +134,8 @@ def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
         transition[TransitionKey.COMPLEMENTARY_DATA] = pipeline_memory
         return transition
 
-    # Build pipeline to convert keyboard deltas to ee pose action to joint action
-    keyboard_to_robot_joints_processor = RobotProcessorPipeline[
+    # Build pipeline to convert gamepad deltas to ee pose action to joint action
+    gamepad_to_robot_joints_processor = RobotProcessorPipeline[
         tuple[RobotAction, RobotObservation], RobotAction
     ](
         steps=[
@@ -149,7 +154,7 @@ def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
                 end_effector_bounds=EE_BOUNDS,
                 max_ee_step_m=0.05,
             ),
-            # Keyboard gripper commands are discrete: {0=close, 1=stay, 2=open}
+            # Gamepad gripper commands are discrete: {0=close, 1=stay, 2=open}
             GripperVelocityToJoint(
                 speed_factor=GRIPPER_SPEED_FACTOR,
                 discrete_gripper=True,
@@ -174,7 +179,7 @@ def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
     # Init rerun viewer (optional: the example runs fine without the viz extra)
     visualize = True
     try:
-        init_rerun(session_name="keyboard_so100_teleop")
+        init_rerun(session_name="gamepad_so100_teleop")
     except (ImportError, RuntimeError) as e:
         logging.warning(f"Rerun visualization unavailable ({e}), running without visualization.")
         visualize = False
@@ -182,7 +187,7 @@ def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
     if not robot.is_connected or not teleop_device.is_connected:
         raise ValueError("Robot or teleop is not connected!")
 
-    print("Starting teleop loop. Use the keyboard to teleoperate the robot...")
+    print("Starting teleop loop. Use the gamepad to teleoperate the robot...")
     try:
         while True:
             t0 = time.perf_counter()
@@ -191,19 +196,19 @@ def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
             robot_obs = robot.get_observation()
 
             # Get teleop action
-            keyboard_action = _apply_operator_view_rotation(
+            gamepad_action = _apply_operator_view_rotation(
                 teleop_device.get_action(), operator_view_rotation_deg
             )
 
-            # Keyboard deltas -> EE pose -> Joints transition
-            joint_action = keyboard_to_robot_joints_processor((keyboard_action, robot_obs))
+            # Gamepad deltas -> EE pose -> Joints transition
+            joint_action = gamepad_to_robot_joints_processor((gamepad_action, robot_obs))
 
             # Send action to robot
             _ = robot.send_action(joint_action)
 
             # Visualize
             if visualize:
-                log_rerun_data(observation=keyboard_action, action=joint_action)
+                log_rerun_data(observation=gamepad_action, action=joint_action)
 
             precise_sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
     except KeyboardInterrupt:
