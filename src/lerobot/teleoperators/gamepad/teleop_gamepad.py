@@ -58,18 +58,17 @@ class GamepadTeleop(Teleoperator):
 
     @property
     def action_features(self) -> dict:
+        names = {"delta_x": 0, "delta_y": 1, "delta_z": 2}
+        if self.config.use_orientation:
+            names["delta_pitch"] = len(names)
+            names["delta_roll"] = len(names)
         if self.config.use_gripper:
-            return {
-                "dtype": "float32",
-                "shape": (4,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2, "gripper": 3},
-            }
-        else:
-            return {
-                "dtype": "float32",
-                "shape": (3,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2},
-            }
+            names["gripper"] = len(names)
+        return {
+            "dtype": "float32",
+            "shape": (len(names),),
+            "names": names,
+        }
 
     @property
     def feedback_features(self) -> dict:
@@ -102,6 +101,11 @@ class GamepadTeleop(Teleoperator):
             "delta_y": gamepad_action[1],
             "delta_z": gamepad_action[2],
         }
+
+        if self.config.use_orientation:
+            delta_roll, delta_pitch = self.gamepad.get_rotation_deltas()
+            action_dict["delta_pitch"] = delta_pitch
+            action_dict["delta_roll"] = delta_roll
 
         # Default gripper action is to stay
         gripper_action = GripperAction.STAY.value

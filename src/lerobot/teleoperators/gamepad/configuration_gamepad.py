@@ -23,3 +23,7 @@ from ..config import TeleoperatorConfig
 @dataclass
 class GamepadTeleopConfig(TeleoperatorConfig):
     use_gripper: bool = True
+    # Adds end-effector orientation control (delta_pitch/delta_roll). Currently only
+    # implemented for the Logitech Dual Action's HID layout on macOS (roll from the right
+    # stick X, pitch from the D-pad up/down); other controllers/modes read pitch as 0.
+    use_orientation: bool = False
