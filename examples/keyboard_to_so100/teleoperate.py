@@ -49,22 +49,10 @@ import math
 import time
 
 from lerobot.model.kinematics import RobotKinematics
-from lerobot.processor import (
-    MapDeltaActionToRobotActionStep,
-    RobotProcessorPipeline,
-    TransitionKey,
-    robot_action_observation_to_transition,
-    transition_to_robot_action,
-)
 from lerobot.robots.so_follower import SO100Follower, SO100FollowerConfig
-from lerobot.robots.so_follower.robot_kinematic_processor import (
-    EEBoundsAndSafety,
-    EEReferenceAndDelta,
-    GripperVelocityToJoint,
-    InverseKinematicsRLStep,
-)
+from lerobot.robots.so_follower.robot_kinematic_processor import build_ee_delta_to_joints_pipeline
 from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
-from lerobot.types import RobotAction, RobotObservation
+from lerobot.types import RobotAction
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
@@ -105,7 +93,7 @@ def _apply_operator_view_rotation(action: RobotAction, degrees: float) -> RobotA
 def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
     # Initialize the robot and teleoperator
     robot_config = SO100FollowerConfig(
-        port="/dev/tty.usbmodem5A460814411", id="my_awesome_follower_arm", use_degrees=True
+        port="/dev/tty.usbmodem58FA0919081", id="randy", use_degrees=True
     )
     teleop_config = KeyboardEndEffectorTeleopConfig(use_gripper=True, use_orientation=True)
 
@@ -120,51 +108,18 @@ def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
         joint_names=list(robot.bus.motors.keys()),
     )
 
-    # Carry complementary data (the previous IK solution) across control ticks so
-    # EEReferenceAndDelta can reference the previously commanded joints.
-    pipeline_memory: dict = {}
-
-    def to_transition_with_memory(action_observation: tuple[RobotAction, RobotObservation]):
-        transition = robot_action_observation_to_transition(action_observation)
-        transition[TransitionKey.COMPLEMENTARY_DATA] = pipeline_memory
-        return transition
-
-    # Build pipeline to convert keyboard deltas to ee pose action to joint action
-    keyboard_to_robot_joints_processor = RobotProcessorPipeline[
-        tuple[RobotAction, RobotObservation], RobotAction
-    ](
-        steps=[
-            # {delta_x/y/z, delta_pitch, delta_roll, gripper} -> {enabled, target_*, gripper_vel}
-            MapDeltaActionToRobotActionStep(rotation_scale=EE_ROT_STEP_RAD),
-            # Velocity-style control: per-tick deltas are applied relative to the
-            # previously commanded pose (the IK solution from the last tick).
-            EEReferenceAndDelta(
-                kinematics=kinematics_solver,
-                end_effector_step_sizes={"x": EE_STEP_SIZE_M, "y": EE_STEP_SIZE_M, "z": EE_STEP_SIZE_M},
-                motor_names=list(robot.bus.motors.keys()),
-                use_latched_reference=False,
-                use_ik_solution=True,
-            ),
-            EEBoundsAndSafety(
-                end_effector_bounds=EE_BOUNDS,
-                max_ee_step_m=0.05,
-            ),
-            # Keyboard gripper commands are discrete: {0=close, 1=stay, 2=open}
-            GripperVelocityToJoint(
-                speed_factor=GRIPPER_SPEED_FACTOR,
-                discrete_gripper=True,
-            ),
-            # Seed IK from its previous solution (not the measured joints) so the commanded
-            # joints are deterministic for a stable target and cannot oscillate with the
-            # motors. This step also publishes its solution to the complementary data.
-            InverseKinematicsRLStep(
-                kinematics=kinematics_solver,
-                motor_names=list(robot.bus.motors.keys()),
-                initial_guess_current_joints=False,
-            ),
-        ],
-        to_transition=to_transition_with_memory,
-        to_output=transition_to_robot_action,
+    # Build pipeline to convert keyboard deltas to ee pose action to joint action.
+    # `pipeline_memory` carries the previous IK solution across control ticks so
+    # EEReferenceAndDelta can reference the previously commanded joints -- see
+    # build_ee_delta_to_joints_pipeline's docstring for why. It isn't read
+    # directly here; the pipeline closes over it internally on every call.
+    keyboard_to_robot_joints_processor, pipeline_memory = build_ee_delta_to_joints_pipeline(
+        kinematics_solver,
+        list(robot.bus.motors.keys()),
+        ee_step_size_m=EE_STEP_SIZE_M,
+        ee_bounds=EE_BOUNDS,
+        gripper_speed_factor=GRIPPER_SPEED_FACTOR,
+        rotation_scale=EE_ROT_STEP_RAD,
     )
 
     # Connect to the robot and teleoperator

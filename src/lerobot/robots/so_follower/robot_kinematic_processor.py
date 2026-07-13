@@ -24,13 +24,17 @@ from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.model import RobotKinematics
 from lerobot.processor import (
     EnvTransition,
+    MapDeltaActionToRobotActionStep,
     ObservationProcessorStep,
     ProcessorStep,
     ProcessorStepRegistry,
     RobotAction,
     RobotActionProcessorStep,
     RobotObservation,
+    RobotProcessorPipeline,
     TransitionKey,
+    robot_action_observation_to_transition,
+    transition_to_robot_action,
 )
 from lerobot.utils.rotation import Rotation
 
@@ -649,3 +653,64 @@ class InverseKinematicsRLStep(ProcessorStep):
     def reset(self):
         """Resets the initial guess for the IK solver."""
         self.q_curr = None
+
+
+def build_ee_delta_to_joints_pipeline(
+    kinematics: RobotKinematics,
+    motor_names: list[str],
+    *,
+    ee_step_size_m: float = 0.004,
+    ee_bounds: dict | None = None,
+    gripper_speed_factor: float = 0.05,
+    rotation_scale: float = 0.0087,
+    max_ee_step_m: float = 0.05,
+) -> tuple[RobotProcessorPipeline, dict]:
+    """Build the standard delta-teleop -> joint-space IK pipeline.
+
+    This is the same 5-step assembly (MapDeltaActionToRobotActionStep ->
+    EEReferenceAndDelta -> EEBoundsAndSafety -> GripperVelocityToJoint ->
+    InverseKinematicsRLStep) that examples/gamepad_to_so100/teleoperate.py
+    and examples/keyboard_to_so100/teleoperate.py each built inline -- pulled
+    out here so both (and any other caller driving continuous small-step EE
+    control) share one implementation instead of drifting apart.
+
+    Returns (pipeline, pipeline_memory). `pipeline_memory` is the mutable
+    dict that must be kept alive by the caller for the lifetime of one
+    control session -- it's what lets InverseKinematicsRLStep's published
+    IK_solution feed back into EEReferenceAndDelta on the next tick (see
+    use_ik_solution=True below). Build a NEW pipeline (and memory dict) per
+    logical control session -- don't reuse one across sessions that aren't a
+    continuous sequence of ticks, since EEBoundsAndSafety's jump check
+    (_last_pos) and InverseKinematicsRLStep's IK seed (q_curr) both assume
+    the previous tick's commanded pose is still valid.
+    """
+    if ee_bounds is None:
+        ee_bounds = {"min": [-0.45, -0.45, 0.02], "max": [0.45, 0.45, 0.45]}
+
+    pipeline_memory: dict = {}
+
+    def to_transition_with_memory(action_observation: tuple[RobotAction, RobotObservation]) -> EnvTransition:
+        transition = robot_action_observation_to_transition(action_observation)
+        transition[TransitionKey.COMPLEMENTARY_DATA] = pipeline_memory
+        return transition
+
+    pipeline = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+        steps=[
+            MapDeltaActionToRobotActionStep(rotation_scale=rotation_scale),
+            EEReferenceAndDelta(
+                kinematics=kinematics,
+                end_effector_step_sizes={"x": ee_step_size_m, "y": ee_step_size_m, "z": ee_step_size_m},
+                motor_names=motor_names,
+                use_latched_reference=False,
+                use_ik_solution=True,
+            ),
+            EEBoundsAndSafety(end_effector_bounds=ee_bounds, max_ee_step_m=max_ee_step_m),
+            GripperVelocityToJoint(speed_factor=gripper_speed_factor, discrete_gripper=True),
+            InverseKinematicsRLStep(
+                kinematics=kinematics, motor_names=motor_names, initial_guess_current_joints=False
+            ),
+        ],
+        to_transition=to_transition_with_memory,
+        to_output=transition_to_robot_action,
+    )
+    return pipeline, pipeline_memory

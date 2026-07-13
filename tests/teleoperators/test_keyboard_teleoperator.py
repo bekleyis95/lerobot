@@ -23,12 +23,21 @@ from lerobot.utils.import_utils import _pynput_available
 if not _pynput_available:
     pytest.skip("pynput not available", allow_module_level=True)
 
-from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
-from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
+from pynput import keyboard
+
+from lerobot.teleoperators.keyboard.configuration_keyboard import (
+    KeyboardEndEffectorTeleopConfig,
+    KeyboardTeleopConfig,
+)
+from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardEndEffectorTeleop, KeyboardTeleop
 
 
 def _make_keyboard_teleop() -> KeyboardTeleop:
     return KeyboardTeleop(KeyboardTeleopConfig())
+
+
+def _make_ee_keyboard_teleop() -> KeyboardEndEffectorTeleop:
+    return KeyboardEndEffectorTeleop(KeyboardEndEffectorTeleopConfig())
 
 
 def test_released_key_is_removed_not_stored_as_false():
@@ -68,3 +77,28 @@ def test_tap_then_opposite_key_is_not_shadowed():
     teleop._drain_pressed_keys()
 
     assert teleop.current_pressed == {"up": True}
+
+
+def test_get_teleop_events_does_not_clear_held_movement_keys(monkeypatch):
+    """Regression test: get_teleop_events() used to unconditionally clear
+    current_pressed at the end of every call. current_pressed is the same
+    dict get_action() reads to decide which movement keys are still held, so
+    any caller polling get_teleop_events() once per control tick -- a real,
+    intended usage pattern; hil_processor.py's AddTeleopEventsAsInfoStep
+    registers it as a per-step ProcessorStep run every environment step --
+    would see a physically-held movement key wiped after every single tick,
+    degrading continuous hold-to-move into one tick of motion per key press.
+    """
+    teleop = _make_ee_keyboard_teleop()
+    monkeypatch.setattr(type(teleop), "is_connected", property(lambda self: True))
+
+    teleop.event_queue.put((keyboard.Key.shift, True))
+    teleop._drain_pressed_keys()
+    assert teleop.current_pressed == {keyboard.Key.shift: True}
+
+    teleop.get_teleop_events()
+    teleop.get_teleop_events()  # called every tick in a real loop -- must be idempotent
+
+    assert teleop.current_pressed == {keyboard.Key.shift: True}
+    action = teleop.get_action()
+    assert action["delta_z"] == -1  # shift still held -> continuous "up", not zeroed out

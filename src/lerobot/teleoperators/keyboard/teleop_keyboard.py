@@ -280,7 +280,18 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         ]
         is_intervention = any(self.current_pressed.get(key, False) for key in movement_keys)
 
-        self.current_pressed.clear()
+        # NOTE: deliberately not clearing self.current_pressed here (it used to be
+        # cleared unconditionally). current_pressed is the same dict get_action()
+        # reads to decide which movement keys are still held -- a caller that polls
+        # get_teleop_events() once per control tick (this method is registered as a
+        # per-step ProcessorStep in hil_processor.py's AddTeleopEventsAsInfoStep, so
+        # that's a real, intended usage pattern) would see a physically-held
+        # movement key wiped after every single tick, degrading continuous
+        # hold-to-move into "one tick of motion per key press". current_pressed
+        # already self-corrects on release via _on_release's current_pressed.pop(),
+        # so nothing here relied on this clear() for correctness: misc keys
+        # (s/r/q) are debounced independently by draining misc_keys_queue below,
+        # which empties completely on every call regardless.
 
         # Check for episode control commands from misc_keys_queue
         terminate_episode = False
