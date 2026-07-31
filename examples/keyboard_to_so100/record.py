@@ -60,7 +60,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
 )
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
-from lerobot.types import RobotAction, RobotObservation
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.utils.feature_utils import combine_feature_dicts
 from lerobot.utils.keyboard_input import apply_recording_control
 from lerobot.utils.utils import log_say
