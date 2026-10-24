@@ -92,9 +92,7 @@ def _apply_operator_view_rotation(action: RobotAction, degrees: float) -> RobotA
 
 def main(operator_view_rotation_deg: float = OPERATOR_VIEW_ROTATION_DEG):
     # Initialize the robot and teleoperator
-    robot_config = SO100FollowerConfig(
-        port="/dev/tty.usbmodem58FA0919081", id="randy", use_degrees=True
-    )
+    robot_config = SO100FollowerConfig(port="/dev/tty.usbmodem58FA0919081", id="randy", use_degrees=True)
     teleop_config = KeyboardEndEffectorTeleopConfig(use_gripper=True, use_orientation=True)
 
     # Initialize the robot and teleoperator
